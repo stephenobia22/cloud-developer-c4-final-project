@@ -1,151 +1,73 @@
-import * as AWS from "aws-sdk";
-import * as AWSXRay from "aws-xray-sdk";
-import { DocumentClient } from "aws-sdk/clients/dynamodb";
-import { createLogger } from "../utils/logger";
+import { APIGatewayProxyEvent } from "aws-lambda";
+import { getUserId } from "../lambda/utils";
 import { TodoItem } from "../models/TodoItem";
-// import { TodoUpdate } from "../models/TodoUpdate";
+import { CreateTodoRequest } from "../requests/CreateTodoRequest";
+import * as uuid from "uuid";
+import { TodoAccess } from "./dataLayer";
 import { UpdateTodoRequest } from "../requests/UpdateTodoRequest";
+import { getUploadUrl } from "./attachmentUtils";
 
-const XAWS = AWSXRay.captureAWS(AWS);
-
-const todoDBIndex = process.env.TODOS_CREATED_AT_INDEX;
-
-const logger = createLogger("TodosAccess");
-
-// TODO: Implement the dataLayer logic
-
-export class TodoAccess {
-  constructor(
-    private readonly docClient: DocumentClient = createDynamoDBClient(),
-    private readonly todosTable = process.env.TODOS_TABLE
-  ) {}
-
-  async getAllUserTodos(userId: string): Promise<TodoItem[]> {
-    logger.info("Getting all user todos");
-
-    const result = await this.docClient
-      .query({
-        TableName: this.todosTable,
-        // IndexName : userId,
-        KeyConditionExpression: "userId = :userId",
-        ExpressionAttributeValues: {
-          ":userId": userId,
-        },
-      })
-      .promise();
-
-    const items = result.Items;
-    return items as TodoItem[];
-  }
-
-  async getTodoById(todoId: string): Promise<TodoItem> {
-    logger.info("Getting todo by Id");
-
-    const result = await this.docClient
-      .query({
-        TableName: this.todosTable,
-        IndexName: todoDBIndex,
-        KeyConditionExpression: "todoId = :todoId",
-        ExpressionAttributeValues: {
-          ":todoId": todoId,
-        },
-      })
-      .promise();
-
-    const items = result.Items;
-
-    if (items.length !== 0) {
-      return items[0] as TodoItem;
-    }
-  }
-
-  async createTodo(todo: TodoItem): Promise<TodoItem> {
-    logger.info("Creating todo item for user");
-    await this.docClient
-      .put({
-        TableName: this.todosTable,
-        Item: todo,
-      })
-      .promise();
-
-    return todo;
-  }
-
-  async getTodoUsingTodoIdAndUserId(todoId: string, userId: string) {
-    logger.info("Getting todo item for user: ", { userId: userId });
-
-    const result = await this.docClient
-      .get({
-        TableName: this.todosTable,
-        Key: { todoId: todoId, userId: userId },
-      })
-      .promise();
-
-    return !!result.Item;
-  }
-
-  async updateTodo(
-    todoId: string,
-    userId: string,
-    updatedTodo: UpdateTodoRequest
-  ) {
-    logger.info("Updating todo item", { todoId });
-
-    await this.docClient
-      .update({
-        TableName: this.todosTable,
-        Key: { todoId: todoId, userId: userId },
-        UpdateExpression:
-          "set #name = :name, #dueDate = :dueDate, #done = :done",
-        ExpressionAttributeNames: {
-          "#name": "name",
-          "#dueDate": "dueDate",
-          "#done": "done",
-        },
-        ExpressionAttributeValues: {
-          ":name": updatedTodo.name,
-          ":dueDate": updatedTodo.dueDate,
-          ":done": updatedTodo.done,
-        },
-      })
-      .promise();
-  }
+const todoAccess = new TodoAccess();
 
 
-  async updateTodoImageAttribute(todoId: string, userId: string, attachmentUrl: string) {
-    logger.info("Updating todo image index");
+export async function createTodo(
+  event: APIGatewayProxyEvent,
+  newTodo: CreateTodoRequest
+): Promise<TodoItem> {
+  const todoId = uuid.v4();
 
-    await this.docClient
-      .update({
-        TableName: this.todosTable,
-        Key: { todoId: todoId, userId: userId },
-        UpdateExpression:
-          "set #attachmentUrl = :attachmentUrl",
-        ExpressionAttributeNames: {
-          "#attachmentUrl": "attachmentUrl",
-        },
-        ExpressionAttributeValues: {
-          ":attachmentUrl": attachmentUrl,
-        },
-      })
-      .promise();
-  }
+  const userId = getUserId(event);
+  const todoItem: TodoItem = {
+    todoId,
+    userId,
+    createdAt: new Date().toISOString(),
+    name: newTodo.name,
+    dueDate: newTodo.dueDate,
+    done: false,
+    attachmentUrl: "",
+  };
 
-  async deleteTodo(
-    todoId: string,
-    userId: string,
-  ) {
-    logger.info("Deleting todo item", { todoId });
-
-    await this.docClient
-      .delete({
-        TableName: this.todosTable,
-        Key: { todoId: todoId, userId: userId },
-      })
-      .promise();
-  }
+  return await todoAccess.createTodo(todoItem);
 }
 
-function createDynamoDBClient() {
-  return new XAWS.DynamoDB.DocumentClient();
+export async function getAllUserTodos(
+  event: APIGatewayProxyEvent
+): Promise<TodoItem[]> {
+  const userId = getUserId(event);
+  return await todoAccess.getAllUserTodos(userId);
+}
+
+
+export async function createAttachmentPresignedUrl(todoId: string): Promise<string> {
+    return getUploadUrl(todoId)
+}
+
+
+export async function updateTodo(todoId:string, event: APIGatewayProxyEvent): Promise<TodoItem> {
+  const userId = getUserId(event);
+  const updatedTodo: UpdateTodoRequest = JSON.parse(event.body)
+
+  // Check if todo created by user exists
+  const todo = await todoAccess.getTodoUsingTodoIdAndUserId(todoId, userId)
+
+  if (!todo){
+    return null
+  }
+
+
+  await todoAccess.updateTodo(todoId, userId, updatedTodo)
+}
+
+export async function deleteTodo(todoId: string, event: APIGatewayProxyEvent): Promise<TodoItem> {
+  const userId = getUserId(event);
+  console.log("Attempting to delete a todo", todoId, userId)
+
+  // Check if todo created by user exists
+  const todo = await todoAccess.getTodoUsingTodoIdAndUserId(todoId, userId)
+
+  if (!todo){
+    return null
+  }
+
+  await todoAccess.deleteTodo(todoId, userId)
 }
